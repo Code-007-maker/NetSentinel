@@ -30,9 +30,13 @@ class GNNEncoder(nn.Module):
         self.edge_encoder = nn.Linear(edge_in_dim, node_in_dim)
         self.conv1 = SAGEConv(node_in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
+        # Stabilise the scale arriving from variable-size graphs without
+        # projecting every graph onto a unit sphere.  LayerNorm is applied to
+        # the pooled feature vector; the latent magnitude remains learnable.
+        self.pool_norm = nn.LayerNorm(hidden_dim)
         self.fc = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, x, edge_index, edge_attr=None, batch=None):
+    def forward(self, x, edge_index, edge_attr=None, batch=None, return_components: bool = False):
         """
         Args:
             x: Node features (N, node_in_dim)
@@ -56,5 +60,12 @@ class GNNEncoder(nn.Module):
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
         h_graph = global_mean_pool(h, batch)
-        z_t = self.fc(h_graph)
+        latent_pre_norm = self.fc(self.pool_norm(h_graph))
+        # Do not use L2 normalisation here: it erased magnitude information and
+        # allowed the temporal transition to converge to one unit direction.
+        z_t = latent_pre_norm
+        if return_components:
+            # Kept opt-in so the model API remains compatible while diagnostics
+            # can distinguish pooling collapse from projection/normalisation.
+            return z_t, h_graph, latent_pre_norm
         return z_t

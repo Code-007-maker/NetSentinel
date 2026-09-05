@@ -67,11 +67,12 @@ class GraphSequence:
 class DataSplit:
     """
     Complete train / val / test sets across all datasets.
-    Each split is a list of (graph_at_t, future_labels_K) pairs.
+    Each split is a list of (graph_at_t, future_attacks_K, future_raw_labels_K,
+    future_graphs_K) tuples.
     """
-    train: List[Tuple[Data, List[int], List[str]]] = field(default_factory=list)
-    val:   List[Tuple[Data, List[int], List[str]]] = field(default_factory=list)
-    test:  List[Tuple[Data, List[int], List[str]]] = field(default_factory=list)
+    train: List[Tuple[Data, List[int], List[str], List[Data]]] = field(default_factory=list)
+    val:   List[Tuple[Data, List[int], List[str], List[Data]]] = field(default_factory=list)
+    test:  List[Tuple[Data, List[int], List[str], List[Data]]] = field(default_factory=list)
 
 
 # ------------------------------------------------------------------
@@ -131,7 +132,9 @@ class DatasetManager:
                 assert len(future_attacks) == k, (
                     f"future target length {len(future_attacks)} != K={k} for {seq.source}"
                 )
-                samples.append((g_t, future_attacks, future_raws))
+                samples.append(
+                    (g_t, future_attacks, future_raws, seq.graphs[t + 1 : t + k + 1])
+                )
                 
             M = len(samples)
             if M < 3:
@@ -185,18 +188,31 @@ class DatasetManager:
             benigns = len(samps) - attacks
             return f"attack={attacks} benign={benigns}", attacks, benigns
             
-        print("CLASS DISTRIBUTION")
+        def dist_horizon(samps, k_h: int):
+            ys = [int(ex[1][k_h - 1]) for ex in samps if ex[1] and len(ex[1]) >= k_h]
+            if not ys:
+                return "attack=0 benign=0", 0, 0
+            attacks = int(sum(ys))
+            benigns = int(len(ys) - attacks)
+            return f"attack={attacks} benign={benigns}", attacks, benigns
+
+        print("CLASS DISTRIBUTION (any future step in 1..K is attack)")
         t_dist, t_a, t_b = dist(split.train)
         v_dist, v_a, v_b = dist(split.val)
         te_dist, te_a, te_b = dist(split.test)
-        
         print(f"    train: {t_dist}")
         print(f"    val:   {v_dist}")
         print(f"    test:  {te_dist}")
+        k_h = k
+        print(f"CLASS DISTRIBUTION (t+K={k_h} target only)")
+        print(f"    train: {dist_horizon(split.train, k_h)[0]}")
+        print(f"    val:   {dist_horizon(split.val, k_h)[0]}")
+        print(f"    test:  {dist_horizon(split.test, k_h)[0]}")
         print()
-        
-        if (v_a > 0 and v_b == 0) or (v_b > 0 and v_a == 0):
-            logger.warning("VALIDATION_SINGLE_CLASS_WARNING: Validation set contains only one class.")
+
+        _, v_a_k, v_b_k = dist_horizon(split.val, k_h)
+        if (v_a_k > 0 and v_b_k == 0) or (v_b_k > 0 and v_a_k == 0):
+            logger.warning("VALIDATION_SINGLE_CLASS_WARNING: t+K validation labels contain only one class.")
             
         return split
 

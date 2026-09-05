@@ -444,8 +444,23 @@ class TestModelShapes:
         z = torch.randn(1, 128)
         attack_prob, net_state, mitre_logits = decoder(z)
         assert attack_prob.shape == (1, 1)
-        assert net_state.shape == (1, 5)
+        assert net_state.shape == (1, 128)
         assert mitre_logits.shape == (1, 14)
+
+    def test_decoder_state_target_matches_latent_dim(self):
+        decoder = StateDecoder(z_dim=64, num_mitre_tactics=14)
+        z = torch.randn(1, 64)
+        _, net_state, _ = decoder(z)
+        assert net_state.shape == (1, 64)
+
+    def test_pos_weight_upweights_positive_class(self):
+        y = torch.tensor([[1.0], [0.0]])
+        p = torch.tensor([[0.1], [0.9]])
+        pos_weight = 3.0
+        bce = torch.nn.BCELoss(reduction='none')
+        sample_weight = torch.where(y >= 0.5, torch.tensor([[pos_weight]]), torch.ones_like(y))
+        weighted = (bce(p, y) * sample_weight).mean(dim=1)
+        assert weighted[0] > weighted[1]
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +553,14 @@ class TestThresholdSelection:
         y_test[:] = 1
         t2, _ = select_decision_threshold(y_val, p_val)
         assert t1 == t2
+
+    def test_collapsed_validation_scores_fall_back_to_0_5(self):
+        from src.evaluate import select_decision_threshold
+        y_val = np.array([0, 1, 0, 1])
+        p_val = np.array([0.47, 0.48, 0.49, 0.51])
+        t_val, m_val = select_decision_threshold(y_val, p_val)
+        assert t_val == 0.5
+        assert m_val["selection_criterion"] == "collapsed_scores_fallback_0.5"
 
 
 class TestFutureTargetAlignment:
@@ -652,4 +675,51 @@ class TestExplainability:
         for name in names:
             assert name in EDGE_FEATURE_NAMES
         assert "direction" in expl["ranked"][0]
+
+
+class TestLRFeatureSchema:
+    def test_build_lr_features_is_11d_not_15d(self):
+        from src.baseline_model import LR_FEATURE_DIM, build_lr_features
+        df = _make_flow_df(12)
+        windows = create_time_windows(df, window_ms=500)
+        g = GraphBuilder().build_window_graph(list(windows.values())[0])
+        X, y = build_lr_features([(g, [0, 0, 1], None)])
+        assert X.shape == (1, 11)
+        assert X.shape[1] == LR_FEATURE_DIM
+        assert X.shape[1] != 15
+        assert int(y[0]) == 1
+
+    def test_predict_proba_rejects_dimension_mismatch(self):
+        from sklearn.linear_model import LogisticRegression
+        from src.baseline_model import assert_lr_input_matches_model
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(20, 11)).astype(np.float32)
+        y = np.array([0] * 10 + [1] * 10)
+        model = LogisticRegression(max_iter=200, random_state=0).fit(X, y)
+        assert int(model.n_features_in_) == 11
+        assert_lr_input_matches_model(model, X[:2])
+        with pytest.raises(ValueError, match="canonical schema dim"):
+            assert_lr_input_matches_model(model, rng.normal(size=(2, 15)).astype(np.float32))
+
+    def test_legacy_15d_artifact_is_invalidated(self, tmp_path):
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+        from src.baseline_model import load_lr_bundle, save_lr_schema
+        rng = np.random.default_rng(1)
+        X = rng.normal(size=(20, 15)).astype(np.float32)
+        y = np.array([0] * 10 + [1] * 10)
+        model = LogisticRegression(max_iter=200, random_state=0).fit(X, y)
+        joblib.dump(model, tmp_path / "lr_baseline.joblib")
+        save_lr_schema(tmp_path)  # schema says 11; model is 15
+        loaded, schema, status = load_lr_bundle(tmp_path)
+        assert loaded is None
+        assert "Rebuild required" in status or "Incompatible" in status
+        assert schema is not None
+
+    def test_checkpoint_schema_records_lr_dim(self, tmp_path):
+        from src.baseline_model import LR_FEATURE_DIM, LR_FEATURE_NAMES, load_lr_schema, save_lr_schema
+        save_lr_schema(tmp_path)
+        schema = load_lr_schema(tmp_path)
+        assert schema["n_features"] == LR_FEATURE_DIM == 11
+        assert schema["feature_names"] == list(LR_FEATURE_NAMES)
 

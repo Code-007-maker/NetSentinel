@@ -102,25 +102,61 @@ def select_decision_threshold(
         metrics["threshold"] = fallback
         metrics["youden_j"] = metrics["recall"] - metrics["fpr"]
         metrics["selection_criterion"] = "fallback_0.5_single_class_val"
+        metrics["threshold_grid"] = []
         return fallback, metrics
 
-    best_t = float(grid[0])
-    best_j = -np.inf
-    best_metrics: Dict[str, float] = {}
+    # Collapsed scores: Youden J is flat and tie-break would pick 0.90 even though
+    # no threshold is informative. Do not treat that as a real operating point.
+    if y_prob_val.size:
+        score_range = float(np.max(y_prob_val) - np.min(y_prob_val))
+        score_std = float(np.std(y_prob_val))
+    else:
+        score_range, score_std = 0.0, 0.0
 
+    rows = []
     for t in grid:
         pred = (y_prob_val >= t).astype(int)
         m = evaluate_predictions(y_true_val, pred, y_prob_val)
-        j = m["recall"] - m["fpr"]
-        m["youden_j"] = float(j)
-        # Max J; tie-break toward higher threshold (lower FPR).
+        j = float(m["recall"] - m["fpr"])
+        m["youden_j"] = j
+        m["threshold"] = float(t)
+        rows.append(m)
+
+    # Treat near-boundary, low-separation score distributions as collapsed.
+    # This guards against models that produce probabilities tightly clustered
+    # around 0.5 even when the score range is not literally zero; picking a
+    # threshold on such a distribution is not informative.
+    collapsed = score_range < 0.05 or score_std < 0.02
+    js = [r["youden_j"] for r in rows]
+    flat_j = (max(js) - min(js)) < 1e-9 if js else True
+    if collapsed or flat_j:
+        fallback = 0.5
+        pred = (y_prob_val >= fallback).astype(int)
+        metrics = evaluate_predictions(y_true_val, pred, y_prob_val)
+        metrics["threshold"] = fallback
+        metrics["youden_j"] = metrics["recall"] - metrics["fpr"]
+        metrics["selection_criterion"] = "collapsed_scores_fallback_0.5"
+        metrics["score_range"] = score_range
+        metrics["score_std"] = score_std
+        metrics["threshold_grid"] = rows
+        return fallback, metrics
+
+    best_t = float(rows[0]["threshold"])
+    best_j = -np.inf
+    best_metrics: Dict[str, float] = {}
+    for m in rows:
+        t = float(m["threshold"])
+        j = float(m["youden_j"])
         if j > best_j + 1e-12 or (abs(j - best_j) <= 1e-12 and t > best_t):
             best_j = j
-            best_t = float(t)
-            best_metrics = m
+            best_t = t
+            best_metrics = dict(m)
 
     best_metrics["threshold"] = best_t
     best_metrics["selection_criterion"] = "youden_j_validation_only"
+    best_metrics["score_range"] = score_range
+    best_metrics["score_std"] = score_std
+    best_metrics["threshold_grid"] = rows
     return best_t, best_metrics
 
 

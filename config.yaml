@@ -33,6 +33,8 @@ hyperparameters:
 
   # Optimiser
   learning_rate: 0.001
+  # A final safety guard after input scaling; diagnostics log pre/post norms.
+  gradient_clip_norm: 5.0
   num_epochs: 20               # for full training
 
   # Sampling
@@ -49,8 +51,10 @@ hyperparameters:
   node_feature_dim: 2          # [out_degree, in_degree]
   edge_feature_dim: 11         # [duration, pkt_fwd, pkt_bwd, bytes_fwd, bytes_bwd, rate_fwd, rate_bwd, byte_rate_fwd, byte_rate_bwd, avg_pkt_size_fwd, avg_pkt_size_bwd]
 
-  # Number of macroscopic network-state features predicted by the net_state_head
-  net_state_features: 5
+  # Number of latent network-state features predicted by the net_state_head.
+  # This must match the GNN latent dimension so the head predicts the future
+  # latent state z_{t+K}, not an unrelated 5-feature summary.
+  net_state_features: 128
 
   # MITRE tactics count
   num_mitre_tactics: 14

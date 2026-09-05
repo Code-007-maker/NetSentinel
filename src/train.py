@@ -42,13 +42,24 @@ from typing import Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.linear_model import LogisticRegression
 
+from src.baseline_model import (
+    LR_FEATURE_DIM,
+    LR_FEATURE_NAMES,
+    artifact_compatible,
+    assert_lr_input_matches_model,
+    build_lr_features,
+    save_lr_schema,
+)
 from src.config import load_config
-from src.dataset_manager import DatasetManager
+from src.dataset_adapters import CICIDSAdapter, CTU13Adapter, UNSWAdapter
+from src.dataset_manager import DatasetManager, is_attack_label
 from src.evaluate import (
     evaluate_predictions,
     format_probability_audit,
@@ -58,8 +69,10 @@ from src.evaluate import (
 from src.explainability import explain_edge_features, format_top_features
 from src.feature_schema import EDGE_FEATURE_NAMES, EDGE_FEATURE_DIM
 from src.gnn_encoder import GNNEncoder
+from src.graph_builder import GraphBuilder
 from src.mitre_mapper import MitreMapper
 from src.preprocessing import FlowFeatureScaler
+from src.temporal_windowing import create_time_windows
 from src.utils import set_seed
 from src.world_model import StateDecoder, TemporalWorldModel
 
@@ -68,6 +81,220 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _tensor_stats(name: str, tensor: torch.Tensor) -> str:
+    """Compact, reproducible numeric health summary for a tensor."""
+    if not torch.isfinite(tensor).all():
+        raise FloatingPointError(f"Non-finite values in {name}")
+    detached = tensor.detach()
+    return (f"{name}: min={detached.min().item():.6g} max={detached.max().item():.6g} "
+            f"mean={detached.mean().item():.6g} std={detached.std(unbiased=False).item():.6g} "
+            f"l2={torch.linalg.vector_norm(detached).item():.6g}")
+
+
+def _assert_finite(name: str, tensor: torch.Tensor) -> None:
+    if not torch.isfinite(tensor).all():
+        raise FloatingPointError(f"Non-finite values in {name}")
+
+
+def _class_stats(values: torch.Tensor, labels: torch.Tensor, name: str) -> str:
+    """Per-class scalar summary used by the smoke representation audit."""
+    items = []
+    for label, label_name in ((1, "attack"), (0, "benign")):
+        subset = values[labels == label]
+        if subset.numel():
+            items.append(
+                f"{label_name}(n={subset.size(0)} mean={subset.mean().item():.6g} "
+                f"std={subset.std(unbiased=False).item():.6g})"
+            )
+    return f"{name}: " + " ".join(items)
+
+
+@torch.no_grad()
+def log_representation_audit(
+    gnn: GNNEncoder, wm: TemporalWorldModel, decoder: StateDecoder,
+    examples: List[Tuple], k: int, split_name: str, max_examples: int = 128,
+    mode: str = "eval",
+) -> Dict[str, float]:
+    """Measure sample variation through GNN -> pooling -> GRU -> attack logit.
+
+    Targets are strictly the supplied split's y_(t+K); this routine does not
+    select hyperparameters or inspect test labels for a training decision.
+    """
+    if mode not in {"train", "eval"}:
+        raise ValueError(f"Unsupported audit mode {mode!r}")
+    prior_modes = (gnn.training, wm.training, decoder.training)
+    for module in (gnn, wm, decoder):
+        module.train(mode == "train")
+    rows = []
+    for ex in examples[:max_examples]:
+        g_t, future_attacks, _, future_graphs = _normalise_example(ex)
+        if g_t is None or g_t.x.numel() == 0 or len(future_attacks) < k:
+            continue
+        z_t, pooled, latent_pre_norm = gnn(g_t.x, g_t.edge_index, g_t.edge_attr, return_components=True)
+        z1, h = wm(z_t.unsqueeze(1))
+        z1_pre = wm.last_transition_pre_activation
+        predicted = [z1] + wm.rollout(z1, h, k=k - 1)
+        transition_pres = [z1_pre] + list(wm.last_rollout_pre_activations)
+        logit = decoder.forward_logits(predicted[-1])[0]
+        true_zs = []
+        for step_i, graph in enumerate(future_graphs[:k], start=1):
+            if graph is None or graph.x.numel() == 0:
+                true_zs = []
+                break
+            z_true = gnn(graph.x, graph.edge_index, graph.edge_attr)
+            true_zs.append(z_true.squeeze(0))
+            if len(rows) < 3:
+                logger.info(
+                    "TARGET_ID[%s/%s] sample=%d step=t+%d graph_id=%d nodes=%d edges=%d z_true_l2=%.6g",
+                    split_name, mode, len(rows), step_i, id(graph), graph.x.size(0),
+                    graph.edge_index.size(1), torch.linalg.vector_norm(z_true).item(),
+                )
+        if len(true_zs) != k:
+            continue
+        rows.append((int(future_attacks[k - 1]), pooled.squeeze(0), latent_pre_norm.squeeze(0), z_t.squeeze(0),
+                     *[z.squeeze(0) for z in transition_pres], *[z.squeeze(0) for z in predicted],
+                     *true_zs, logit.squeeze()))
+    for module, prior_mode in zip((gnn, wm, decoder), prior_modes):
+        module.train(prior_mode)
+    if not rows:
+        return {}
+
+    labels = torch.tensor([r[0] for r in rows], dtype=torch.long)
+    pooled, latent_pre_norm, z_t = (torch.stack([r[i] for r in rows]) for i in (1, 2, 3))
+    transition_pres = [torch.stack([r[4 + i] for r in rows]) for i in range(k)]
+    preds = [torch.stack([r[4 + k + i] for r in rows]) for i in range(k)]
+    true_zs = [torch.stack([r[4 + 2 * k + i] for r in rows]) for i in range(k)]
+    logits = torch.stack([r[4 + 3 * k] for r in rows]).reshape(-1)
+    probs = torch.sigmoid(logits)
+
+    def embedding_summary(name: str, values: torch.Tensor) -> None:
+        norms = torch.linalg.vector_norm(values, dim=1)
+        per_dim = values.std(dim=0, unbiased=False)
+        unit = F.normalize(values, p=2, dim=1, eps=1e-12)
+        cosine = unit @ unit.T
+        off_diagonal = cosine[~torch.eye(len(values), dtype=torch.bool)] if len(values) > 1 else cosine.reshape(-1)
+        logger.info(
+            "REP_AUDIT[%s/%s] %s mean=%.6g std=%.6g per_dim_std_mean=%.6g "
+            "norm_mean=%.6g norm_std=%.6g cosine_offdiag_mean=%.6g cosine_offdiag_std=%.6g euclidean_offdiag_mean=%.6g",
+            split_name, mode, name, values.mean().item(), values.std(unbiased=False).item(),
+            per_dim.mean().item(), norms.mean().item(), norms.std(unbiased=False).item(),
+            off_diagonal.mean().item(), off_diagonal.std(unbiased=False).item(),
+            torch.cdist(values, values)[~torch.eye(len(values), dtype=torch.bool)].mean().item() if len(values) > 1 else 0.0,
+        )
+    embedding_summary("graph_pooled", pooled)
+    embedding_summary("latent_before_normalization", latent_pre_norm)
+    embedding_summary("z_t", z_t)
+    for i, (pre, pred) in enumerate(zip(transition_pres, preds), start=1):
+        embedding_summary(f"z_t_plus_{i}_before_tanh", pre)
+        embedding_summary(f"z_t_plus_{i}", pred)
+        embedding_summary(f"true_z_t_plus_{i}", true_zs[i - 1])
+        model_mse = F.mse_loss(pred, true_zs[i - 1])
+        mean_baseline = F.mse_loss(true_zs[i - 1].mean(dim=0, keepdim=True).expand_as(true_zs[i - 1]), true_zs[i - 1])
+        logger.info("TRANSITION_QUALITY[%s/%s] t+%d model_mse=%.6g mean_baseline_mse=%.6g ratio=%.6g variance_ratio=%.6g",
+                    split_name, mode, i, model_mse.item(), mean_baseline.item(),
+                    (model_mse / mean_baseline.clamp_min(1e-12)).item(),
+                    (pred.var(unbiased=False) / true_zs[i - 1].var(unbiased=False).clamp_min(1e-12)).item())
+    logger.info("REP_AUDIT[%s/%s] samples=%d attack=%d benign=%d", split_name, mode, len(rows), int(labels.sum()), int((labels == 0).sum()))
+    logger.info("REP_AUDIT[%s/%s] %s", split_name, mode, _class_stats(logits, labels, "attack_logit"))
+    logger.info("REP_AUDIT[%s/%s] %s", split_name, mode, _class_stats(probs, labels, "attack_probability"))
+    return {
+        "z_t_per_dim_std": float(z_t.std(dim=0, unbiased=False).mean().item()),
+        "z_k_per_dim_std": float(preds[-1].std(dim=0, unbiased=False).mean().item()),
+        "logit_std": float(logits.std(unbiased=False).item()),
+        "probability_std": float(probs.std(unbiased=False).item()),
+    }
+
+
+def log_loss_gradient_contributions(
+    gnn: GNNEncoder, wm: TemporalWorldModel, decoder: StateDecoder, example: Tuple,
+    k: int, bce_loss: nn.BCELoss, mse_loss: nn.MSELoss, ce_loss: nn.CrossEntropyLoss,
+    mapper: MitreMapper, pos_weight: float, delta_loss_weight: float = 0.0,
+) -> None:
+    """Report independent loss gradients without applying an optimizer step."""
+    total, attack, state, mitre, delta = compute_step_loss(
+        gnn, wm, decoder, example, k, bce_loss, mse_loss, ce_loss, mapper, pos_weight, delta_loss_weight
+    )
+    _assert_finite("gradient_probe_total", total)
+    blocks = {
+        "gnn": list(gnn.parameters()), "wm": list(wm.parameters()),
+        "attack_head": list(decoder.attack_head.parameters()),
+    }
+    for name, loss in (("attack", attack), ("state", state), ("delta", delta), ("mitre_x0.1", mitre * 0.1), ("total", total)):
+        for module in (gnn, wm, decoder):
+            module.zero_grad(set_to_none=True)
+        if not loss.requires_grad or float(loss.detach()) == 0.0:
+            logger.info("LOSS_GRAD[%s] inactive", name)
+            continue
+        loss.backward(retain_graph=True)
+        norms = {}
+        for block, params in blocks.items():
+            grads = [p.grad.detach().flatten() for p in params if p.grad is not None]
+            norms[block] = float(torch.linalg.vector_norm(torch.cat(grads)).item()) if grads else 0.0
+        logger.info("LOSS_GRAD[%s] value=%.6g norms=%s", name, loss.item(), norms)
+    for module in (gnn, wm, decoder):
+        module.zero_grad(set_to_none=True)
+
+
+@torch.no_grad()
+def log_frozen_embedding_probe(
+    gnn: GNNEncoder, wm: TemporalWorldModel, train_examples: List[Tuple],
+    val_examples: List[Tuple], k: int,
+) -> None:
+    """Validation-only linear probe: separates embedding adequacy from head training."""
+    def features(examples: List[Tuple]):
+        X, y = [], []
+        for ex in examples:
+            g_t, future_attacks, _, _ = _normalise_example(ex)
+            if g_t is None or g_t.x.numel() == 0 or len(future_attacks) < k:
+                continue
+            z_t = gnn(g_t.x, g_t.edge_index, g_t.edge_attr)
+            z1, h = wm(z_t.unsqueeze(1))
+            pred = wm.rollout(z1, h, k=k - 1)
+            X.append((pred[-1] if pred else z1).squeeze(0).cpu().numpy())
+            y.append(int(future_attacks[k - 1]))
+        return np.asarray(X), np.asarray(y, dtype=int)
+    X_tr, y_tr = features(train_examples)
+    X_va, y_va = features(val_examples)
+    if len(X_tr) and len(X_va) and len(np.unique(y_tr)) == 2 and len(np.unique(y_va)) == 2:
+        probe = LogisticRegression(max_iter=1000, random_state=0).fit(X_tr, y_tr)
+        p = probe.predict_proba(X_va)[:, 1]
+        metrics = evaluate_predictions(y_va, (p >= 0.5).astype(int), p)
+        logger.info("FROZEN_Z_LINEAR_PROBE[val] P=%.3f R=%.3f F1=%.3f AUC=%.3f prob_std=%.6g",
+                    metrics.get("precision", 0), metrics.get("recall", 0), metrics.get("f1", 0),
+                    metrics.get("roc_auc", 0), float(np.std(p)))
+    else:
+        logger.warning("FROZEN_Z_LINEAR_PROBE skipped: train/validation needs both target classes.")
+
+
+def _scale_unique_graphs(scaler: FlowFeatureScaler, data_split) -> int:
+    """Apply the train-fitted scaler exactly once to every graph in all splits."""
+    seen = set()
+    for split in (data_split.train, data_split.val, data_split.test):
+        for example in split:
+            g_t, _, _, future_graphs = _normalise_example(example)
+            for graph in [g_t, *future_graphs]:
+                if graph is not None and id(graph) not in seen:
+                    scaler.scale_graph(graph)
+                    seen.add(id(graph))
+    return len(seen)
+
+
+@torch.no_grad()
+def _log_pretraining_latents(gnn: GNNEncoder, wm: TemporalWorldModel, example: Tuple, label: str) -> None:
+    """Audit encoder targets and recursive predictions before any optimizer step."""
+    g_t, _, _, future_graphs = _normalise_example(example)
+    z_t = gnn(g_t.x, g_t.edge_index, g_t.edge_attr)
+    logger.info("%s %s", label, _tensor_stats("z_t", z_t))
+    for i, graph in enumerate(future_graphs[:3], start=1):
+        if graph is not None and graph.x.numel() > 0:
+            z_true = gnn(graph.x, graph.edge_index, graph.edge_attr)
+            logger.info("%s %s", label, _tensor_stats(f"z_t_plus_{i}_true", z_true))
+    z1, h = wm(z_t.unsqueeze(1))
+    predicted = [z1] + wm.rollout(z1, h, k=2)
+    for i, z_pred in enumerate(predicted, start=1):
+        logger.info("%s %s", label, _tensor_stats(f"z_t_plus_{i}_pred", z_pred))
 
 
 # ------------------------------------------------------------------
@@ -110,6 +337,127 @@ def label_to_mitre_idx(raw_label: str, mapper: MitreMapper) -> Optional[int]:
 # Single training step
 # ------------------------------------------------------------------
 
+def _normalise_example(example: Tuple):
+    """Accept legacy (G_t, future_attacks, future_raws) and expanded samples
+    containing future graphs as the fourth item."""
+    if len(example) == 3:
+        g_t, future_attacks, future_raws = example
+        future_graphs = []
+    elif len(example) >= 4:
+        g_t, future_attacks, future_raws, future_graphs = example[:4]
+    else:
+        raise ValueError(f"Unexpected example tuple length {len(example)}")
+    return g_t, future_attacks, future_raws, future_graphs
+
+
+def compute_step_loss(
+    gnn: GNNEncoder,
+    wm: TemporalWorldModel,
+    decoder: StateDecoder,
+    example: Tuple,
+    k: int,
+    bce_loss: nn.BCELoss,
+    mse_loss: nn.MSELoss,
+    ce_loss: nn.CrossEntropyLoss,
+    mapper: MitreMapper,
+    pos_weight: float = 1.0,
+    delta_loss_weight: float = 0.0,
+    diagnostics: bool = False,
+):
+    """Return (total_loss, attack_loss, state_loss, mitre_loss, delta_loss)."""
+    g_t, future_attacks, future_raws, future_graphs = _normalise_example(example)
+    if g_t is None or g_t.x.size(0) == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    z_t = gnn(g_t.x, g_t.edge_index, g_t.edge_attr)  # (1, z_dim)
+    _assert_finite("z_t", z_t)
+    z_seq = z_t.unsqueeze(1)
+    z_pred_t1, h_n = wm(z_seq)
+    future_zs = wm.rollout(z_pred_t1, h_n, k=k - 1)
+    all_pred_zs = [z_pred_t1] + future_zs
+    all_deltas = [wm.last_delta] + list(wm.last_rollout_deltas)
+
+    for step_i, z_pred in enumerate(all_pred_zs, start=1):
+        _assert_finite(f"predicted_state_t_plus_{step_i}", z_pred)
+        if diagnostics:
+            logger.info("Latent rollout %s", _tensor_stats(f"z_t_plus_{step_i}_pred", z_pred))
+
+    attack_total = torch.tensor(0.0, device=z_t.device, dtype=z_t.dtype)
+    state_total = torch.tensor(0.0, device=z_t.device, dtype=z_t.dtype)
+    mitre_total = torch.tensor(0.0, device=z_t.device, dtype=z_t.dtype)
+    delta_total = torch.tensor(0.0, device=z_t.device, dtype=z_t.dtype)
+    previous_true = z_t
+    bce_unreduced = nn.BCEWithLogitsLoss(reduction='none')
+    step_count = 0
+
+    for step_i, z_pred in enumerate(all_pred_zs):
+        if step_i >= len(future_attacks):
+           break
+
+        attack_logits, net_state_pred, mitre_logits = decoder.forward_logits(z_pred)
+        _assert_finite("attack_logits", attack_logits)
+        attack_prob = torch.sigmoid(attack_logits)
+        _assert_finite("attack_probabilities", attack_prob)
+        y_att = torch.tensor([[float(future_attacks[step_i])]], device=attack_logits.device, dtype=attack_logits.dtype)
+
+        l_att_raw = bce_unreduced(attack_logits, y_att)
+        sample_weight = torch.where(
+           y_att >= 0.5,
+           torch.tensor([[pos_weight]], device=attack_prob.device, dtype=attack_prob.dtype),
+           torch.ones_like(y_att),
+        )
+        attack_total = attack_total + (l_att_raw * sample_weight).mean()
+        step_count += 1
+
+        if step_i < len(future_graphs):
+           next_graph = future_graphs[step_i]
+           if next_graph is not None and getattr(next_graph, "x", None) is not None and next_graph.x.numel() > 0:
+               z_next_true = gnn(next_graph.x, next_graph.edge_index, next_graph.edge_attr).detach()
+               _assert_finite(f"z_next_true_t_plus_{step_i + 1}", z_next_true)
+               if net_state_pred.shape == z_next_true.shape:
+                   # Directly supervise the recursive transition.  Previously
+                   # only a decoder MLP was compared to the future state, so a
+                   # constant rollout could still satisfy state supervision.
+                   transition_loss = mse_loss(z_pred, z_next_true)
+                   decoder_state_loss = mse_loss(net_state_pred, z_next_true)
+                   state_total = state_total + transition_loss + 0.1 * decoder_state_loss
+                   if wm.transition_mode == "residual":
+                       true_delta = z_next_true - previous_true
+                       delta_total = delta_total + mse_loss(all_deltas[step_i], true_delta)
+                   previous_true = z_next_true
+                   if diagnostics:
+                       logger.info("Direct transition loss t+%d=%.6g decoder-state loss=%.6g",
+                                   step_i + 1, transition_loss.item(), decoder_state_loss.item())
+                       logger.info("State target %s", _tensor_stats(f"z_t_plus_{step_i + 1}_true", z_next_true))
+                       logger.info("State prediction %s", _tensor_stats(f"net_state_t_plus_{step_i + 1}", net_state_pred))
+               else:
+                   raise ValueError(
+                       f"State-target mismatch: net_state_pred shape {tuple(net_state_pred.shape)} "
+                       f"!= z_next_true shape {tuple(z_next_true.shape)}"
+                   )
+
+        raw_lbl = future_raws[step_i] if step_i < len(future_raws) else "Benign"
+        mitre_idx = label_to_mitre_idx(raw_lbl, mapper)
+        if mitre_idx is not None:
+           target_mitre = torch.tensor([mitre_idx], dtype=torch.long, device=mitre_logits.device)
+           mitre_total = mitre_total + ce_loss(mitre_logits, target_mitre)
+
+    # Explicit objective weighting: state dynamics is supervised directly;
+    # MITRE remains auxiliary and may not dominate the shared GRU/encoder.
+    total_loss = attack_total + state_total + 0.1 * mitre_total + delta_loss_weight * delta_total
+    _assert_finite("attack_loss", attack_total)
+    _assert_finite("state_loss", state_total)
+    _assert_finite("total_loss", total_loss)
+    if diagnostics:
+        logger.info("First-batch losses: attack_loss=%.6g state_loss=%.6g state_weighted=%.6g mitre_loss=%.6g total_loss=%.6g",
+                    attack_total.item(), state_total.item(), state_total.item(), 0.1 * mitre_total.item(), total_loss.item())
+        logits_all = torch.cat([decoder.forward_logits(z)[0].detach().flatten() for z in all_pred_zs])
+        probs_all = torch.sigmoid(logits_all)
+        logger.info("Attack logits %s", _tensor_stats("attack_logits", logits_all))
+        logger.info("Attack probabilities %s", _tensor_stats("attack_probabilities", probs_all))
+    return total_loss, attack_total, state_total, mitre_total, delta_total
+
+
 def train_step(
     gnn: GNNEncoder,
     wm: TemporalWorldModel,
@@ -122,71 +470,38 @@ def train_step(
     ce_loss: nn.CrossEntropyLoss,
     mapper: MitreMapper,
     pos_weight: float = 1.0,
+    delta_loss_weight: float = 0.0,
+    gradient_clip_norm: float = 5.0,
+    diagnostics: bool = False,
 ) -> float:
-    """
-    One forward + backward pass on a single training example.
-    example = (G_t, future_attack_labels[1..k], future_raw_labels[1..k])
-
-    Loss components:
-      1. K-step attack BCE losses  (future windows t+1 .. t+k)
-         Class-balanced: benign samples are upweighted by pos_weight = n_attack/n_benign
-         so that the loss gradient for rare benign samples is not swamped by attack.
-      2. MITRE CE at t+1 (where evidence exists)
-
-    NOTE: pos_weight here is n_attack/n_benign (upweights BENIGN to fight class imbalance),
-    applied via sample_weight on reduction='none' BCE then reduced to mean.
-    """
-    g_t, future_attacks, future_raws = example
-
-    if g_t.x.size(0) == 0:
+    """One forward + backward pass on a single training example."""
+    g_t, _, _, _ = _normalise_example(example)
+    if g_t is None or g_t.x.size(0) == 0:
         return 0.0
 
     optimizer.zero_grad()
-
-    # --- Encode current graph S_t (node + edge features) ---
-    z_t = gnn(g_t.x, g_t.edge_index, g_t.edge_attr)  # (1, z_dim)
-
-    # --- WM: 1-step prediction ---
-    z_seq = z_t.unsqueeze(1)                # (1, 1, z_dim)
-    z_pred_t1, h_n = wm(z_seq)             # z_pred_t1: (1, z_dim)
-
-    # --- 2. Recursive K-step rollout + future attack losses ---
-    future_zs = wm.rollout(z_pred_t1, h_n, k=k - 1)
-    all_pred_zs = [z_pred_t1] + future_zs   # list of k tensors
-
-    step_losses = []
-    bce_unreduced = nn.BCELoss(reduction='none')
-    for step_i, z_pred in enumerate(all_pred_zs):
-        if step_i >= len(future_attacks):
-            break
-        attack_prob, net_state_pred, mitre_logits = decoder(z_pred)
-
-        # Attack BCE at t+(step_i+1); last step is t+K.
-        y_att = torch.tensor([[float(future_attacks[step_i])]])
-        l_att_raw = bce_unreduced(attack_prob, y_att)  # shape (1,1)
-        # Upweight benign (y=0) samples by pos_weight to counteract class imbalance.
-        # pos_weight = n_attack / n_benign, so benign loss is scaled up.
-        sample_weight = torch.where(y_att < 0.5,
-                                    torch.tensor([[pos_weight]]),
-                                    torch.ones_like(y_att))
-        l_att = (l_att_raw * sample_weight).mean()
-        step_losses.append(l_att)
-
-        # MITRE CE at t+(step_i+1) — only when evidence exists
-        raw_lbl = future_raws[step_i] if step_i < len(future_raws) else "Benign"
-        mitre_idx = label_to_mitre_idx(raw_lbl, mapper)
-        if mitre_idx is not None:
-            target_mitre = torch.tensor([mitre_idx], dtype=torch.long)
-            l_mitre = ce_loss(mitre_logits, target_mitre)
-            step_losses.append(0.5 * l_mitre)
-
-    if step_losses:
-        total_loss = sum(step_losses)
+    total_loss, _, _, _, _ = compute_step_loss(
+        gnn, wm, decoder, example, k, bce_loss, mse_loss, ce_loss, mapper, pos_weight, delta_loss_weight,
+        diagnostics=diagnostics,
+    )
+    if float(total_loss.detach().item()) != 0.0:
         total_loss.backward()
+        blocks = {"gnn": list(gnn.parameters()), "wm": list(wm.parameters()), "decoder": list(decoder.parameters())}
+        pre_norms = {
+            name: float(torch.linalg.vector_norm(torch.cat([p.grad.detach().flatten() for p in params if p.grad is not None])).item())
+            if any(p.grad is not None for p in params) else 0.0
+            for name, params in blocks.items()
+        }
+        torch.nn.utils.clip_grad_norm_(list(gnn.parameters()) + list(wm.parameters()) + list(decoder.parameters()), gradient_clip_norm)
+        post_norms = {
+            name: float(torch.linalg.vector_norm(torch.cat([p.grad.detach().flatten() for p in params if p.grad is not None])).item())
+            if any(p.grad is not None for p in params) else 0.0
+            for name, params in blocks.items()
+        }
+        if diagnostics:
+            logger.info("Gradient norms pre_clip=%s post_clip=%s clip_norm=%.3f", pre_norms, post_norms, gradient_clip_norm)
         optimizer.step()
-        return total_loss.item()
-
-    return 0.0
+    return float(total_loss.item())
 
 
 # ------------------------------------------------------------------
@@ -216,7 +531,7 @@ def collect_horizon_scores(
     gnn.eval(); wm.eval(); decoder.eval()
     y_true_all, y_prob_all = [], []
 
-    for g_t, future_attacks, _ in examples:
+    for g_t, future_attacks, _, _ in examples:
         if g_t.x.size(0) == 0 or not future_attacks:
             continue
         if len(future_attacks) < k:
@@ -271,6 +586,139 @@ def evaluate_split(
     return metrics
 
 
+def summarize_target_distribution(examples: List[Tuple], k: int, split_name: str = "split") -> Dict[str, float]:
+    """Count positive/negative targets for the t+K horizon."""
+    y_all = []
+    for ex in examples:
+        future_attacks = ex[1] if len(ex) > 1 else []
+        if len(future_attacks) >= k:
+            y_all.append(int(future_attacks[k - 1]))
+    arr = np.asarray(y_all, dtype=int)
+    n_pos = int(arr[arr == 1].size)
+    n_neg = int(arr[arr == 0].size)
+    ratio = float(n_pos / max(n_pos + n_neg, 1))
+    logger.info(
+        "[%s] target-summary total=%d attack=%d benign=%d attack_ratio=%.4f horizon_k=%d",
+        split_name,
+        arr.size,
+        n_pos,
+        n_neg,
+        ratio,
+        k,
+    )
+    return {
+        "total": int(arr.size),
+        "attack": n_pos,
+        "benign": n_neg,
+        "attack_ratio": ratio,
+    }
+
+
+@torch.no_grad()
+def compute_split_loss(
+    gnn: GNNEncoder,
+    wm: TemporalWorldModel,
+    decoder: StateDecoder,
+    examples: List[Tuple],
+    k: int,
+    bce_loss: nn.BCELoss,
+    mse_loss: nn.MSELoss,
+    ce_loss: nn.CrossEntropyLoss,
+    mapper: MitreMapper,
+    pos_weight: float = 1.0,
+    delta_loss_weight: float = 0.0,
+) -> Dict[str, float]:
+    """Compute average attack/state/mitre losses over a split without backprop."""
+    total = 0.0
+    attack = 0.0
+    state = 0.0
+    mitre = 0.0
+    count = 0
+
+    for ex in examples:
+        step_total, step_attack, step_state, step_mitre, _ = compute_step_loss(
+            gnn, wm, decoder, ex, k, bce_loss, mse_loss, ce_loss, mapper, pos_weight, delta_loss_weight
+        )
+        step_total_f = float(step_total.detach().item())
+        step_attack_f = float(step_attack.detach().item())
+        step_state_f = float(step_state.detach().item())
+        step_mitre_f = float(step_mitre.detach().item())
+        if step_total_f == 0.0 and step_attack_f == 0.0 and step_state_f == 0.0 and step_mitre_f == 0.0:
+            continue
+        total += step_total_f
+        attack += step_attack_f
+        state += step_state_f
+        mitre += step_mitre_f
+        count += 1
+
+    if count == 0:
+        return {"total_loss": 0.0, "attack_loss": 0.0, "state_loss": 0.0, "mitre_loss": 0.0}
+    return {
+        "total_loss": total / count,
+        "attack_loss": attack / count,
+        "state_loss": state / count,
+        "mitre_loss": mitre / count,
+    }
+
+
+def audit_probability_distribution(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    """Summaries for attack vs benign probability distributions at threshold 0.5."""
+    y_true = np.asarray(y_true, dtype=int).ravel()
+    y_prob = np.asarray(y_prob, dtype=float).ravel()
+    pred = (y_prob >= threshold).astype(int)
+
+    attack_probs = y_prob[y_true == 1]
+    benign_probs = y_prob[y_true == 0]
+    summaries = {
+        "positive_targets": int((y_true == 1).sum()),
+        "negative_targets": int((y_true == 0).sum()),
+        "attack_target_ratio": float((y_true == 1).mean()) if y_true.size else 0.0,
+        "predicted_attacks_at_threshold": int(pred.sum()),
+        "attack_prob_min": float(np.min(attack_probs)) if attack_probs.size else 0.0,
+        "attack_prob_max": float(np.max(attack_probs)) if attack_probs.size else 0.0,
+        "attack_prob_mean": float(np.mean(attack_probs)) if attack_probs.size else 0.0,
+        "attack_prob_std": float(np.std(attack_probs)) if attack_probs.size else 0.0,
+        "benign_prob_min": float(np.min(benign_probs)) if benign_probs.size else 0.0,
+        "benign_prob_max": float(np.max(benign_probs)) if benign_probs.size else 0.0,
+        "benign_prob_mean": float(np.mean(benign_probs)) if benign_probs.size else 0.0,
+        "benign_prob_std": float(np.std(benign_probs)) if benign_probs.size else 0.0,
+    }
+    logger.info(
+        "Probability audit thr=%.2f attacked=%d benign=%d predicted_attacks=%d attack_ratio=%.3f "
+        "attack_mean=%.4f benign_mean=%.4f attack_std=%.4f benign_std=%.4f",
+        threshold,
+        summaries["positive_targets"],
+        summaries["negative_targets"],
+        summaries["predicted_attacks_at_threshold"],
+        summaries["attack_target_ratio"],
+        summaries["attack_prob_mean"],
+        summaries["benign_prob_mean"],
+        summaries["attack_prob_std"],
+        summaries["benign_prob_std"],
+    )
+    return summaries
+
+
+def log_parameter_health(gnn: GNNEncoder, wm: TemporalWorldModel, decoder: StateDecoder, epoch: int, param_snapshot: Optional[dict] = None) -> None:
+    """Log gradient norms and parameter movement for the main model blocks."""
+    blocks = {
+        "gnn": list(gnn.parameters()),
+        "wm": list(wm.parameters()),
+        "decoder": list(decoder.parameters()),
+    }
+    for name, params in blocks.items():
+        grads = [p.grad.norm().item() for p in params if p.grad is not None]
+        total_grad = float(np.sum(grads)) if grads else 0.0
+        logger.info("[epoch %d] %s grad_norm_sum=%.6f nonzero_grad_params=%d", epoch, name, total_grad, len(grads))
+
+        if param_snapshot is not None and name in param_snapshot:
+            max_delta = 0.0
+            for old, new in zip(param_snapshot[name], params):
+                if old is not None and new is not None:
+                    max_delta = max(max_delta, float((new.detach() - old.detach()).abs().max().item()))
+            logger.info("[epoch %d] %s max_param_delta=%.6f", epoch, name, max_delta)
+
+
 # ------------------------------------------------------------------
 # K-selection experiment
 # ------------------------------------------------------------------
@@ -290,31 +738,8 @@ def select_k(
     return best_k
 
 
-# ------------------------------------------------------------------
-# Logistic Regression baseline
-# ------------------------------------------------------------------
-
-def build_lr_features(examples: List[Tuple]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Extract per-graph aggregate features for Logistic Regression.
-    Features: [out_degree_mean, in_degree_mean, edge_count, node_count,
-               mean_edge_feat_0..10]  (11 edge feature columns)
-    Target: future_attacks[-1] (t+K attack label — SAME horizon as World Model rollout)
-    """
-    X, y = [], []
-    for g_t, future_attacks, _ in examples:
-        if g_t.x.size(0) == 0 or not future_attacks:
-            continue
-        node_feats = g_t.x.numpy()          # (N, 2)
-        edge_feats = g_t.edge_attr.numpy() if g_t.edge_attr.numel() > 0 else np.zeros((1, 11))
-        feat = np.concatenate([
-            node_feats.mean(axis=0),         # [mean_out_deg, mean_in_deg]
-            [g_t.num_edges, g_t.num_nodes],  # scalar counts
-            edge_feats.mean(axis=0),         # 11 expanded flow features
-        ])
-        X.append(feat)
-        y.append(future_attacks[-1])  # t+K target — same horizon as World Model
-    return np.array(X, dtype=np.float32), np.array(y, dtype=int)
+# Logistic Regression feature construction lives in src/baseline_model.py
+# (window-mean of the same 11 EDGE_FEATURE_NAMES as the World Model).
 
 
 # ------------------------------------------------------------------
@@ -326,7 +751,7 @@ def save_checkpoint(
     gnn: GNNEncoder,
     wm: TemporalWorldModel,
     decoder: StateDecoder,
-    lr_model: LogisticRegression,
+    lr_model: Optional[LogisticRegression],
     scaler: FlowFeatureScaler,
     selected_k: int,
     cfg: dict,
@@ -353,8 +778,22 @@ def save_checkpoint(
         ckpt_dir / "world_model.pt",
     )
 
-    # LR baseline
-    joblib.dump(lr_model, ckpt_dir / "lr_baseline.joblib")
+    # LR baseline + explicit feature schema (must match training dim)
+    if lr_model is not None:
+        n_in = int(getattr(lr_model, "n_features_in_", -1))
+        if n_in != LR_FEATURE_DIM:
+            raise ValueError(
+                f"Refusing to save LR with n_features_in_={n_in}; canonical dim is {LR_FEATURE_DIM}."
+            )
+        joblib.dump(lr_model, ckpt_dir / "lr_baseline.joblib")
+        save_lr_schema(ckpt_dir)
+    else:
+        stale = ckpt_dir / "lr_baseline.joblib"
+        if stale.exists():
+            stale.unlink()
+        schema_path = ckpt_dir / "lr_schema.json"
+        if schema_path.exists():
+            schema_path.unlink()
 
     # Preprocessing scaler + feature schema
     scaler.save(ckpt_dir)
@@ -365,6 +804,10 @@ def save_checkpoint(
     snapshot["threshold_criterion"] = (threshold_meta or {}).get(
         "selection_criterion", "youden_j_validation_only"
     )
+    snapshot["lr_feature_names"] = list(LR_FEATURE_NAMES)
+    snapshot["lr_feature_dim"] = int(LR_FEATURE_DIM)
+    if snapshot.get("hyperparameters"):
+        snapshot["hyperparameters"]["lr_feature_dim"] = int(LR_FEATURE_DIM)
     (ckpt_dir / "training_config.json").write_text(
         json.dumps(snapshot, indent=2, default=str), encoding="utf-8"
     )
@@ -376,7 +819,8 @@ def save_checkpoint(
 # Main training function
 # ------------------------------------------------------------------
 
-def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None) -> None:
+def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None,
+          transition: str = "direct", delta_scale: float = 0.5, delta_loss_weight: float = 0.25) -> None:
     cfg = load_config()
     hp = cfg["hyperparameters"]
     set_seed(hp["random_seed"])
@@ -413,6 +857,9 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
         "Total: train=%d  val=%d  test=%d examples",
         len(data_split.train), len(data_split.val), len(data_split.test),
     )
+    summarize_target_distribution(data_split.train, k_default, "train")
+    summarize_target_distribution(data_split.val, k_default, "val")
+    summarize_target_distribution(data_split.test, k_default, "test")
 
     # ------------------------------------------------------------------
     # 2. Fit feature scaler on TRAINING data only
@@ -423,7 +870,7 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
     # For LR we use graph-level aggregate features (no scaler needed there).
     scaler = FlowFeatureScaler()
     all_edge_feats = []
-    for g_t, _, _ in data_split.train:
+    for g_t, _, _, _ in data_split.train:
         if g_t is not None and g_t.edge_attr is not None and g_t.edge_attr.numel() > 0:
             all_edge_feats.append(g_t.edge_attr.numpy())
     if all_edge_feats:
@@ -451,31 +898,54 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
         z_dim=hp["gnn_out_dim"],
         hidden_dim=hp["wm_hidden_dim"],
         num_layers=hp["wm_num_layers"],
+        transition_mode=transition, delta_scale=delta_scale,
     )
+    logger.info("TRANSITION_EXPERIMENT mode=%s delta_scale=%.3f delta_loss_weight=%.3f", transition, delta_scale, delta_loss_weight)
     decoder = StateDecoder(
         z_dim=hp["gnn_out_dim"],
         num_mitre_tactics=hp["num_mitre_tactics"],
     )
+    # This audit documents the original failure mode: raw physical-unit edge
+    # attributes were previously fed directly into the GNN despite fitting a scaler.
+    _log_pretraining_latents(gnn, wm, data_split.train[0], "PRE-SCALE")
+    scaled_graphs = _scale_unique_graphs(scaler, data_split)
+    logger.info("Applied train-fitted edge-feature scaling to %d unique graphs.", scaled_graphs)
+    _log_pretraining_latents(gnn, wm, data_split.train[0], "POST-SCALE")
     mapper = MitreMapper(cfg["mitre"]["mapping_file"])
 
     optimizer = optim.Adam(
         list(gnn.parameters()) + list(wm.parameters()) + list(decoder.parameters()),
         lr=hp["learning_rate"],
     )
-    bce_loss = nn.BCELoss()
+    bce_loss = nn.BCEWithLogitsLoss()
     mse_loss = nn.MSELoss()
     ce_loss  = nn.CrossEntropyLoss()
 
-    # Class weight: upweight BENIGN samples so the model doesn't collapse to
-    # predicting attack for everything (FPR=1.0 root cause).
-    # pos_weight = n_attack / n_benign  (benign loss multiplied by this ratio)
+    # Report the horizon target distribution separately from the loss targets.
     train_y_k = [ex[1][-1] for ex in data_split.train if ex[1]]
     n_pos = int(sum(train_y_k))   # attack count
     n_neg = int(len(train_y_k) - n_pos)  # benign count
-    pos_weight = float(n_pos / max(n_neg, 1))  # n_attack/n_benign — upweights benign
+    # The attack loss is applied at every future step.  Balance precisely those
+    # train-only targets: w_attack=n_benign/n_attack, w_benign=1.  This makes
+    # both classes contribute equally and fixes the constant-logit optimum at .5.
+    attack_loss_targets = [int(y) for ex in data_split.train for y in ex[1][:k_default]]
+    loss_pos = int(sum(attack_loss_targets))
+    loss_neg = len(attack_loss_targets) - loss_pos
+    pos_weight = float(loss_neg / max(loss_pos, 1))
+    neg_weight = 1.0
     logger.info(
-        "BCE pos_weight=n_attack/n_benign (upweights benign)=%.4f  (attack=%d benign=%d)",
-        pos_weight, n_pos, n_neg,
+        "Class-balanced BCE sample weights (train t+1..t+K): attack_weight=%.4f benign_weight=%.4f "
+        "(attack=%d benign=%d)", pos_weight, neg_weight, loss_pos, loss_neg,
+    )
+    weighted_constant = (pos_weight * loss_pos) / max(pos_weight * loss_pos + loss_neg, 1e-12)
+    unweighted_constant = loss_pos / max(len(attack_loss_targets), 1)
+    logger.info(
+        "Attack-loss prior across t+1..t+K: attack=%d benign=%d; constant-logit optimum "
+        "weighted=%.4f (pos_weight=%.4f), unweighted=%.4f",
+        loss_pos, loss_neg, weighted_constant, pos_weight, unweighted_constant,
+    )
+    log_loss_gradient_contributions(
+        gnn, wm, decoder, data_split.train[0], k_default, bce_loss, mse_loss, ce_loss, mapper, pos_weight, delta_loss_weight
     )
 
     # ------------------------------------------------------------------
@@ -484,8 +954,12 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
     for epoch in range(epochs):
         epoch_loss = 0.0
         gnn.train(); wm.train(); decoder.train()
+        param_snapshot = {
+            "gnn": [p.detach().clone() for p in gnn.parameters()],
+            "wm": [p.detach().clone() for p in wm.parameters()],
+            "decoder": [p.detach().clone() for p in decoder.parameters()],
+        }
 
-        # Shuffle training examples (within-epoch only, never across temporal seqs)
         rng = np.random.default_rng(hp["random_seed"] + epoch)
         indices = rng.permutation(len(data_split.train)).tolist()
 
@@ -498,14 +972,68 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
                 bce_loss, mse_loss, ce_loss,
                 mapper,
                 pos_weight=pos_weight,
+                delta_loss_weight=delta_loss_weight,
+                gradient_clip_norm=float(hp["gradient_clip_norm"]),
+                diagnostics=(idx == indices[0]),
             )
             epoch_loss += loss
 
         avg_loss = epoch_loss / max(len(data_split.train), 1)
-        logger.info("Epoch %d/%d  avg_loss=%.5f", epoch + 1, epochs, avg_loss)
-
+        log_parameter_health(gnn, wm, decoder, epoch + 1, param_snapshot)
+        val_loss = 0.0
+        val_audit = {}
         if data_split.val:
+            val_loss_summary = compute_split_loss(
+                gnn, wm, decoder, data_split.val, k_default, bce_loss, mse_loss, ce_loss, mapper, pos_weight, delta_loss_weight
+            )
+            val_loss = val_loss_summary["total_loss"]
+            y_val_true, y_val_prob = collect_horizon_scores(gnn, wm, decoder, data_split.val, k_default)
+            val_audit = audit_probability_distribution(y_val_true, y_val_prob, threshold=0.5)
+            logger.info(
+                "Epoch %d/%d  train_loss=%.5f  val_loss=%.5f  val_attack_ratio=%.3f "
+                "val_pred_attacks=%d  val_attack_mean=%.4f  val_benign_mean=%.4f",
+                epoch + 1,
+                epochs,
+                avg_loss,
+                val_loss,
+                val_audit.get("attack_target_ratio", 0.0),
+                val_audit.get("predicted_attacks_at_threshold", 0),
+                val_audit.get("attack_prob_mean", 0.0),
+                val_audit.get("benign_prob_mean", 0.0),
+            )
             evaluate_split(gnn, wm, decoder, data_split.val, k_default, "val")
+        else:
+            logger.info("Epoch %d/%d  train_loss=%.5f  val_loss=n/a", epoch + 1, epochs, avg_loss)
+
+    # These audits are diagnostics only: validation labels are not used to
+    # alter the model, optimiser, or hyperparameters.
+    # Four-way diagnostic: data split × module mode.  This changes neither
+    # weights nor thresholds and exposes any train/eval-dependent discrepancy.
+    train_rep_audit = log_representation_audit(gnn, wm, decoder, data_split.train, k_default, "train", mode="eval")
+    train_rep_train_mode = log_representation_audit(gnn, wm, decoder, data_split.train, k_default, "train", mode="train")
+    if data_split.val:
+        val_rep_audit = log_representation_audit(gnn, wm, decoder, data_split.val, k_default, "val", mode="eval")
+        log_representation_audit(gnn, wm, decoder, data_split.val, k_default, "val", mode="train")
+        representation_collapsed = (
+            # This threshold is deliberately relative to the observed latent
+            # scale: 4e-4 was mathematically non-zero yet operationally
+            # collapsed against true train-target per-dimension std ~2.8e-1.
+            train_rep_audit.get("z_k_per_dim_std", 0.0) < 1e-2
+            or train_rep_audit.get("logit_std", 0.0) < 1e-5
+            or train_rep_audit.get("probability_std", 0.0) < 1e-6
+            or
+            val_rep_audit.get("z_k_per_dim_std", 0.0) < 1e-2
+            or val_rep_audit.get("logit_std", 0.0) < 1e-5
+            or val_rep_audit.get("probability_std", 0.0) < 1e-6
+        )
+        logger.info(
+            "MODEL_HEALTH: PIPELINE_PASS=TRUE REPRESENTATION_COLLAPSED=%s MODEL_HEALTH_PASS=%s "
+            "(train_zk_std=%.6g val_zk_std=%.6g val_logit_std=%.6g)",
+            representation_collapsed, not representation_collapsed,
+            train_rep_audit.get("z_k_per_dim_std", 0.0), val_rep_audit.get("z_k_per_dim_std", 0.0),
+            val_rep_audit.get("logit_std", 0.0),
+        )
+        log_frozen_embedding_probe(gnn, wm, data_split.train, data_split.val, k_default)
 
     # ------------------------------------------------------------------
     # 5. K-selection experiment (on validation set)
@@ -519,13 +1047,26 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
     # ------------------------------------------------------------------
     # 6. Logistic Regression baseline (same split, same features)
     # ------------------------------------------------------------------
-    logger.info("Training Logistic Regression baseline...")
+    logger.info(
+        "Training Logistic Regression baseline on %d-d window-mean flow features %s",
+        LR_FEATURE_DIM,
+        LR_FEATURE_NAMES,
+    )
     X_train, y_train = build_lr_features(data_split.train)
     lr_model = LogisticRegression(max_iter=1000, random_state=hp["random_seed"])
     lr_skip_reason = ""
     if len(X_train) > 0:
+        if int(X_train.shape[1]) != LR_FEATURE_DIM:
+            raise ValueError(
+                f"LR training matrix dim {X_train.shape[1]} != {LR_FEATURE_DIM}"
+            )
         if len(np.unique(y_train)) > 1:
             lr_model.fit(X_train, y_train)
+            assert_lr_input_matches_model(lr_model, X_train)
+            ok, reason = artifact_compatible(lr_model, {"feature_names": LR_FEATURE_NAMES, "n_features": LR_FEATURE_DIM})
+            if not ok:
+                raise RuntimeError(reason)
+            logger.info("LR fitted n_features_in_=%d", lr_model.n_features_in_)
         else:
             lr_skip_reason = "Training split contains only one class."
             logger.warning("LR Baseline skipped: %s", lr_skip_reason)
@@ -601,7 +1142,7 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
 
         # Gradient×input explanation on first test graph predicted as future attack
         expl_text = "n/a (no predicted-attack test graph)"
-        for g_t, future_attacks, _ in data_split.test:
+        for g_t, future_attacks, _, _ in data_split.test:
             if g_t.x.size(0) == 0 or g_t.edge_attr is None or g_t.edge_attr.numel() == 0:
                 continue
             expl = explain_edge_features(gnn, wm, decoder, g_t, k=selected_k, top_n=5)
@@ -625,6 +1166,7 @@ def train(mode: str = "smoke", epochs: int = 1, k_override: Optional[int] = None
         if len(X_test) > 0:
             if lr_model is not None:
                 t0 = time.time()
+                assert_lr_input_matches_model(lr_model, X_test)
                 lr_prob = lr_model.predict_proba(X_test)[:, 1]
                 lr_pred = (lr_prob >= 0.5).astype(int)
                 lr_latency = (time.time() - t0) / max(len(X_test), 1) * 1000
@@ -725,7 +1267,7 @@ def _print_smoke_audit(ds_report, data_split, results, selected_k):
     print(SEP)
     all_examples = data_split.train + data_split.val + data_split.test
     all_raw_labels: list = []
-    for _, _, raw_labs in all_examples:
+    for _, _, raw_labs, _ in all_examples:
         all_raw_labels.extend(raw_labs)
     from collections import Counter
     label_dist = Counter(all_raw_labels)
@@ -863,7 +1405,7 @@ def _print_smoke_audit(ds_report, data_split, results, selected_k):
         print("    Root causes (in smoke mode):")
         print("      1. Extreme class imbalance: ~90% attack windows in training data.")
         print("      2. Only 1 epoch of training — model hasn't converged.")
-        print("      3. pos_weight (n_attack/n_benign) upweights benign loss to address imbalance.")
+        print("      3. pos_weight = n_benign / n_attack upweights attack examples when attacks are the minority.")
         print("      4. Youden's J threshold selection is applied on validation set.")
         print("    Expected improvement with full training (20+ epochs, full data).")
         print("    FPR=1.0 in smoke mode is a known limitation, NOT a code bug.")
@@ -932,6 +1474,173 @@ def _write_eval_report(
     logger.info("Evaluation report written to %s", path)
 
 
+def _pick_lr_smoke_files(dataset_dir: Path) -> List[Tuple[Path, object]]:
+    """One real file per supported corpus; does not modify datasets."""
+    picks: List[Tuple[Path, object]] = []
+    cic = sorted((dataset_dir / "CIC-IDS2018").rglob("*.csv")) if (dataset_dir / "CIC-IDS2018").exists() else []
+    ctu = sorted((dataset_dir / "CTU-13-Dataset").rglob("*.binetflow")) if (dataset_dir / "CTU-13-Dataset").exists() else []
+    unsw_root = dataset_dir / "UNSW-NB15"
+    unsw = []
+    if unsw_root.exists():
+        candidates = [
+            p for p in sorted(unsw_root.rglob("*.csv"))
+            if "feature" not in p.name.lower() and "list_events" not in p.name.lower()
+        ]
+        headered = [p for p in candidates if "training" in p.name.lower() or "testing" in p.name.lower()]
+        unsw = headered or candidates
+    if cic:
+        picks.append((cic[0], CICIDSAdapter()))
+    if ctu:
+        picks.append((ctu[0], CTU13Adapter()))
+    if unsw:
+        picks.append((unsw[0], UNSWAdapter()))
+    return picks
+
+
+def _examples_from_loaded_df(df: pd.DataFrame, source: str, k: int, window_ms: int, hp: dict):
+    if df is None or df.empty:
+        return [], [], []
+    if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        df = df.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
+    windows = create_time_windows(df, window_ms=window_ms)
+    builder = GraphBuilder()
+    graphs, labels, raws = [], [], []
+    for w_df in windows.values():
+        g = builder.build_window_graph(w_df)
+        if g is None:
+            continue
+        graphs.append(g)
+        if "label" in w_df.columns and len(w_df):
+            attack = int(any(is_attack_label(str(x)) for x in w_df["label"]))
+            raw = next((str(x) for x in w_df["label"] if is_attack_label(str(x))), str(w_df["label"].iloc[0]))
+        else:
+            attack, raw = 0, "Benign"
+        labels.append(attack)
+        raws.append(raw)
+
+    n_windows = len(graphs)
+    samples = []
+    for t in range(n_windows - k):
+        samples.append((graphs[t], labels[t + 1 : t + k + 1], raws[t + 1 : t + k + 1]))
+    M = len(samples)
+    if M < 3:
+        logger.warning("LR rebuild: %s produced only %d samples, skipping.", source, M)
+        return [], [], []
+    tr_len = int(M * hp.get("train_ratio", 0.70))
+    vl_len = max(1, int(M * hp.get("val_ratio", 0.10)))
+    te_len = M - tr_len - vl_len
+    if te_len <= 0:
+        te_len = 1
+        tr_len = M - vl_len - te_len
+        if tr_len <= 0:
+            tr_len, vl_len, te_len = 1, 1, 1
+    return samples[:tr_len], samples[tr_len:tr_len + vl_len], samples[tr_len + vl_len:]
+
+
+def rebuild_lr_baseline(mode: str = "smoke") -> dict:
+    """
+    Rebuild ONLY the Logistic Regression artifact.
+
+    Uses a bounded read of existing CIC/CTU/UNSW files (nrows on large CSVs)
+    so this does not re-run World Model training or ingest every CIC CSV.
+    Feature schema is the same 11 flow-level edge features as the World Model.
+    """
+    cfg = load_config()
+    hp = cfg["hyperparameters"]
+    set_seed(hp["random_seed"])
+    k = int(hp["k_rollout_steps"])
+    ckpt_dir = Path(cfg["paths"]["checkpoints_dir"])
+    out_dir = Path(cfg["paths"]["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    csv_nrows = 12000 if mode != "full" else None
+
+    stale_path = ckpt_dir / "lr_baseline.joblib"
+    if stale_path.exists():
+        stale = joblib.load(stale_path)
+        n_old = int(getattr(stale, "n_features_in_", -1))
+        if n_old != LR_FEATURE_DIM:
+            logger.warning(
+                "Invalidating incompatible LR artifact n_features_in_=%d (canonical=%d)",
+                n_old, LR_FEATURE_DIM,
+            )
+
+    train_ex, test_ex = [], []
+    files_used = []
+    for path, adapter in _pick_lr_smoke_files(Path(cfg["paths"]["dataset_dir"])):
+        logger.info("LR rebuild loading %s", path)
+        try:
+            if path.suffix.lower() == ".csv" and csv_nrows:
+                raw = pd.read_csv(path, nrows=csv_nrows, low_memory=False)
+                df = adapter.load_flow_data(raw)
+            else:
+                df = adapter.load_flow_data(path)
+        except Exception as exc:
+            logger.warning("LR rebuild skipped %s: %s", path.name, exc)
+            continue
+        tr, _vl, te = _examples_from_loaded_df(
+            df, str(path), k, hp["time_window_ms"], hp
+        )
+        train_ex.extend(tr)
+        test_ex.extend(te)
+        files_used.append(str(path))
+        print(f"LR rebuild file={path.name} train={len(tr)} test={len(te)}")
+
+    X_train, y_train = build_lr_features(train_ex)
+    if len(X_train) == 0 or len(np.unique(y_train)) < 2:
+        raise RuntimeError("Cannot rebuild LR: empty or single-class training split.")
+    if int(X_train.shape[1]) != LR_FEATURE_DIM:
+        raise ValueError(f"LR rebuild dim {X_train.shape[1]} != {LR_FEATURE_DIM}")
+
+    lr_model = LogisticRegression(max_iter=1000, random_state=hp["random_seed"])
+    lr_model.fit(X_train, y_train)
+    assert_lr_input_matches_model(lr_model, X_train)
+
+    joblib.dump(lr_model, ckpt_dir / "lr_baseline.joblib")
+    save_lr_schema(ckpt_dir)
+
+    cfg_snap = ckpt_dir / "training_config.json"
+    if cfg_snap.exists():
+        snap = json.loads(cfg_snap.read_text(encoding="utf-8"))
+        snap["lr_feature_names"] = list(LR_FEATURE_NAMES)
+        snap["lr_feature_dim"] = int(LR_FEATURE_DIM)
+        snap.setdefault("hyperparameters", {})["lr_feature_dim"] = int(LR_FEATURE_DIM)
+        cfg_snap.write_text(json.dumps(snap, indent=2, default=str), encoding="utf-8")
+
+    metrics: dict = {
+        "n_features": int(lr_model.n_features_in_),
+        "feature_names": list(LR_FEATURE_NAMES),
+        "trainable": "YES",
+        "train_rows": int(len(y_train)),
+        "world_model_retrained": False,
+        "files": files_used,
+        "csv_nrows_cap": csv_nrows,
+    }
+    if test_ex:
+        X_test, y_test = build_lr_features(test_ex)
+        assert_lr_input_matches_model(lr_model, X_test)
+        lr_prob = lr_model.predict_proba(X_test)[:, 1]
+        lr_pred = (lr_prob >= 0.5).astype(int)
+        metrics.update(evaluate_predictions(y_test, lr_pred, lr_prob))
+        metrics["test_rows"] = int(len(y_test))
+        print("\nLR REBUILD TEST METRICS (11-d window-mean flow features)")
+        print(f"  n_features_in_={lr_model.n_features_in_}")
+        print(f"  test_rows={len(y_test)}")
+        print(f"  Precision={metrics.get('precision', 0):.4f}")
+        print(f"  Recall={metrics.get('recall', 0):.4f}")
+        print(f"  F1={metrics.get('f1', 0):.4f}")
+        print(f"  FPR={metrics.get('fpr', 0):.4f}")
+        print(f"  ROC-AUC={metrics.get('roc_auc', 0):.4f}")
+
+    (out_dir / "lr_baseline_eval.json").write_text(
+        json.dumps(metrics, indent=2, default=str), encoding="utf-8"
+    )
+    logger.info("Wrote LR artifact to %s (did not train World Model)", ckpt_dir)
+    return metrics
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
@@ -939,10 +1648,18 @@ def _write_eval_report(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the Cybersecurity World Model")
     parser.add_argument(
-        "--mode", choices=["smoke", "full"], default="smoke",
-        help="smoke = tiny deterministic run to verify pipeline; full = production training",
+        "--mode", choices=["smoke", "full", "lr"], default="smoke",
+        help="smoke/full train World Model; lr = rebuild Logistic Regression only",
     )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--k", type=int, default=None, help="Override K rollout steps")
+    parser.add_argument("--transition", choices=["direct", "residual"], default="direct")
+    parser.add_argument("--delta-scale", type=float, default=0.5)
+    parser.add_argument("--delta-loss-weight", type=float, default=0.25)
     args = parser.parse_args()
-    train(mode=args.mode, epochs=args.epochs, k_override=args.k)
+    if args.mode == "lr":
+        rebuild_lr_baseline(mode="smoke")
+    else:
+        train(mode=args.mode, epochs=args.epochs, k_override=args.k,
+              transition=args.transition, delta_scale=args.delta_scale,
+              delta_loss_weight=args.delta_loss_weight)

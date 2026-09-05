@@ -44,3 +44,4 @@ NODE_FEATURE_DIM: int = len(NODE_FEATURE_NAMES)    # 2
 # ── Backward-compat alias (old name) ─────────────────────────────────────────
 UNIFIED_FEATURE_NAMES = EDGE_FEATURE_NAMES
 FLOW_FEATURE_COLS = EDGE_FEATURE_NAMES   # used by FlowFeatureScaler
+# LR baseline uses the same 11 names (window-mean). See src/baseline_model.py.

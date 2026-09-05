@@ -111,6 +111,12 @@ class GraphBuilder:
 
         edge_indices = []
         edge_feats = []
+        # Node identity is retained in ``_node_to_id`` for auditing, but a PyG
+        # graph must contain only nodes active in *this* window.  Reusing the
+        # sequence-wide registry here previously padded later graphs with every
+        # historical, zero-degree node.  Mean pooling then became dominated by
+        # identical inactive-node embeddings and erased window variation.
+        local_node_to_id: Dict[str, int] = {}
 
         for _, row in df.iterrows():
             src = str(row[src_col]).strip()
@@ -119,8 +125,10 @@ class GraphBuilder:
                 self.invalid_ips += int(_is_invalid_identity(src)) + int(_is_invalid_identity(dst))
                 continue
 
-            src_id = self._get_node_id(src)
-            dst_id = self._get_node_id(dst)
+            self._get_node_id(src)
+            self._get_node_id(dst)
+            src_id = local_node_to_id.setdefault(src, len(local_node_to_id))
+            dst_id = local_node_to_id.setdefault(dst, len(local_node_to_id))
             edge_indices.append([src_id, dst_id])
 
             feats = []
@@ -136,7 +144,7 @@ class GraphBuilder:
         edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
         edge_attr = torch.tensor(edge_feats, dtype=torch.float)
 
-        num_nodes = len(self._node_to_id)
+        num_nodes = len(local_node_to_id)
         node_feats = torch.zeros((num_nodes, NODE_FEATURE_DIM), dtype=torch.float)
         if edge_index.numel() > 0:
             out_deg = torch.bincount(edge_index[0], minlength=num_nodes).float()

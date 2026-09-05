@@ -1,7 +1,11 @@
 [theme]
-base="dark"
-primaryColor="#f63366"
-backgroundColor="#0e1117"
-secondaryBackgroundColor="#262730"
-textColor="#fafafa"
-font="sans serif"
+base = "dark"
+primaryColor = "#38bdf8"
+backgroundColor = "#07111f"
+secondaryBackgroundColor = "#101c2e"
+textColor = "#e2e8f0"
+borderColor = "#27415f"
+baseRadius = "medium"
+showWidgetBorder = true
+showSidebarBorder = true
+chartCategoricalColors = ["#38bdf8", "#f59e0b", "#f43f5e", "#34d399"]

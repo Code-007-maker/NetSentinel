@@ -91,6 +91,27 @@ class FlowFeatureScaler:
         logger.info("Scaler loaded from %s", directory)
         return obj
 
+    def transform_edge_attr(self, edge_attr) -> "object":
+        """Scale a graph edge_attr tensor with the train-fitted scaler."""
+        import torch
+        if not self._fitted:
+            raise RuntimeError("Scaler has not been fitted. Call fit() first.")
+        if edge_attr is None or getattr(edge_attr, "numel", lambda: 0)() == 0:
+            return edge_attr
+        x = edge_attr.detach().cpu().numpy()
+        df = pd.DataFrame(x, columns=self.feature_cols)
+        out = self.transform(df)
+        return torch.as_tensor(out, dtype=torch.float32, device=edge_attr.device)
+
+    def scale_graph(self, graph):
+        """In-place scale of graph.edge_attr. Returns the same graph object."""
+        if graph is None:
+            return graph
+        if getattr(graph, "edge_attr", None) is None:
+            return graph
+        graph.edge_attr = self.transform_edge_attr(graph.edge_attr)
+        return graph
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
