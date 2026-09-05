@@ -1,0 +1,71 @@
+paths:
+  # Local data directory (not committed). Create this folder and download datasets into it.
+  dataset_dir: "datasets"
+  log_dir: "logs"
+  checkpoints_dir: "checkpoints"
+  output_dir: "outputs"
+
+hyperparameters:
+  random_seed: 42
+  # Time window for graph construction (milliseconds).
+  # For flow-level data spanning hours, use larger windows (e.g., 60000 = 1 minute).
+  # For packet-level / fine-grained data, use 1000.
+  time_window_ms: 60000       # 1 minute per window - practical for flow-level CSV
+
+  # GNN params
+  gnn_hidden_dim: 128
+  gnn_num_layers: 2
+  gnn_out_dim: 128
+
+  # World Model params
+  wm_hidden_dim: 256
+  wm_num_layers: 2
+
+  # K-step rollout
+  # Candidates evaluated on validation set; best K selected by F1 at K steps.
+  k_rollout_steps: 3           # DEFAULT K (selected by validation performance)
+  k_candidates: [1, 3, 5]      # K-selection experiment values
+
+  # Training split ratios (must sum to 1.0)
+  train_ratio: 0.70
+  val_ratio: 0.10
+  test_ratio: 0.20             # held-out, NEVER touched during training/selection
+
+  # Optimiser
+  learning_rate: 0.001
+  num_epochs: 20               # for full training
+
+  # Sampling
+  # Maximum rows loaded per dataset file. Use -1 for no limit.
+  # Setting a cap avoids OOM on large files.
+  # Full training recommended value: 50000 rows per file.
+  max_rows_per_file: 50000
+  smoke_test_min_windows: 50   # tiny deterministic sample for smoke tests
+
+  # Minimum windows needed to include a dataset file in training.
+  min_windows_per_sequence: 5
+
+  # Node / edge feature dims (must match graph_builder output)
+  node_feature_dim: 2          # [out_degree, in_degree]
+  edge_feature_dim: 11         # [duration, pkt_fwd, pkt_bwd, bytes_fwd, bytes_bwd, rate_fwd, rate_bwd, byte_rate_fwd, byte_rate_bwd, avg_pkt_size_fwd, avg_pkt_size_bwd]
+
+  # Number of macroscopic network-state features predicted by the net_state_head
+  net_state_features: 5
+
+  # MITRE tactics count
+  num_mitre_tactics: 14
+
+  # Number of flow feature columns fed to the Logistic Regression baseline
+  lr_feature_dim: 11
+
+mitre:
+  mapping_file: "mitre_mapping.yaml"
+
+training:
+  # Which datasets to include (matched against subdirectory names, case-insensitive)
+  use_datasets:
+    - "CIC-IDS2018"
+    - "CTU-13-Dataset"
+    - "UNSW-NB15"
+  # Training mode: 'smoke' or 'full'
+  mode: "smoke"

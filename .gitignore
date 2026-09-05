@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Datasets (download separately — never commit)
+datasets/
+data/
+*.csv
+*.tsv
+*.pcap
+*.pcapng
+*.cap
+*.binetflow
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Archives / incomplete downloads
+*.zip
+*.tar
+*.gz
+*.tgz
+*.7z
+*.rar
+*.xz
+*.bz2
+*.crdownload
+
+# ML artifacts / generated outputs
+checkpoints/
+outputs/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.joblib
+*.pkl
+*.pickle
+*.onnx
+*.bin
+*.npy
+*.npz
+*.safetensors
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/

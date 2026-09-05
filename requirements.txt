@@ -1,0 +1,23 @@
+# Core
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+pyyaml>=6.0.0
+
+# PyTorch / GNN
+# CPU wheels are sufficient for smoke tests and the offline Streamlit app.
+# For CUDA, install a matching torch build from https://pytorch.org then reinstall torch-geometric.
+torch>=2.0.0
+torch-geometric>=2.3.0
+
+# PCAP parsing
+scapy>=2.5.0
+pyshark>=0.6.0
+
+# Dashboard
+streamlit>=1.25.0
+plotly>=5.15.0
+
+# Tests
+pytest>=7.4.0

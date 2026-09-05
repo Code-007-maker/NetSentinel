@@ -1,0 +1,95 @@
+# mitre_mapping.yaml
+# Evidence-based mapping of dataset labels/behaviours to MITRE ATT&CK tactics and techniques.
+# Do NOT invent mappings if there is no evidence. Fallback to Unknown/Unsupported.
+
+tactics:
+  Reconnaissance:
+    - "TA0043"
+  Initial_Access:
+    - "TA0001"
+  Execution:
+    - "TA0002"
+  Persistence:
+    - "TA0003"
+  Privilege_Escalation:
+    - "TA0004"
+  Defense_Evasion:
+    - "TA0005"
+  Credential_Access:
+    - "TA0006"
+  Discovery:
+    - "TA0007"
+  Lateral_Movement:
+    - "TA0008"
+  Collection:
+    - "TA0009"
+  Command_and_Control:
+    - "TA0011"
+  Exfiltration:
+    - "TA0010"
+  Impact:
+    - "TA0040"
+
+# Mapping dataset specific labels to MITRE Tactics
+dataset_mapping:
+  # CIC-IDS2018 Example Mappings
+  "Brute Force -Web":
+    tactic: "Initial_Access"
+    technique: "T1110" # Brute Force
+  "Brute Force -XSS":
+    tactic: "Initial_Access"
+    technique: "T1190" # Exploit Public-Facing Application
+  "SQL Injection":
+    tactic: "Initial_Access"
+    technique: "T1190"
+  "DoS attacks-Hulk":
+    tactic: "Impact"
+    technique: "T1498" # Network Denial of Service
+  "DoS attacks-SlowHTTPTest":
+    tactic: "Impact"
+    technique: "T1498"
+  "DDoS attacks-LOIC-HTTP":
+    tactic: "Impact"
+    technique: "T1498"
+  "Bot":
+    tactic: "Command_and_Control"
+    technique: "T1071" # Application Layer Protocol
+  "Infiltration":
+    tactic: "Initial_Access"
+    technique: "T1190"
+
+  # CTU-13 Botnet Mappings
+  "Botnet":
+    tactic: "Command_and_Control"
+    technique: "T1071"
+
+  # UNSW-NB15 Attack Categories
+  "Fuzzers":
+    tactic: "Reconnaissance"
+    technique: "T1595" # Active Scanning
+  "Analysis":
+    tactic: "Reconnaissance"
+    technique: "T1595"
+  "Backdoors":
+    tactic: "Persistence"
+    technique: "T1505" # Server Software Component
+  "Exploits":
+    tactic: "Initial_Access"
+    technique: "T1190"
+  "Generic":
+    tactic: "Unknown"
+    technique: "Unknown"
+  "Reconnaissance":
+    tactic: "Reconnaissance"
+    technique: "T1595"
+  "Shellcode":
+    tactic: "Execution"
+    technique: "T1059" # Command and Scripting Interpreter
+  "Worms":
+    tactic: "Lateral_Movement"
+    technique: "T1210" # Exploitation of Remote Services
+
+# Default Fallback
+fallback:
+  tactic: "Unknown / Unsupported"
+  technique: "Unknown / Unsupported"
