@@ -23,16 +23,16 @@ This is a research/smoke-validated prototype, not a production deployment or rea
 
 ```mermaid
 flowchart LR
-    A[Traffic: CSV / PCAP / PCAPNG / BinetFlow] --> B[Feature extraction]
-    B --> C[Chronological time windows]
-    C --> D[Network graph]
-    D --> E[GNN encoder]
-    E --> F[Latent network state z(t)]
-    F --> G[GRU World Model]
-    G --> H[Recursive K-step rollout]
-    H --> I[Future attack probability]
-    H --> J[MITRE ATT&CK mapping]
-    H --> K[Feature explainability]
+    A["Traffic: CSV / PCAP / PCAPNG / BinetFlow"] --> B["Feature extraction"]
+    B --> C["Chronological time windows"]
+    C --> D["Network graph"]
+    D --> E["GNN encoder"]
+    E --> F["Latent network state"]
+    F --> G["GRU World Model"]
+    G --> H["Recursive K-step rollout"]
+    H --> I["Future attack probability"]
+    H --> J["MITRE ATT&CK mapping"]
+    H --> K["Feature explainability"]
 ```
 
 - Nodes represent observed hosts or network entities. When source/destination identities are unavailable, documented pseudo-node fallbacks are used rather than fabricated IP addresses.
