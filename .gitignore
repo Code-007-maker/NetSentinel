@@ -33,8 +33,6 @@ ENV/
 # Datasets (download separately — never commit)
 datasets/
 data/
-*.csv
-*.tsv
 *.pcap
 *.pcapng
 *.cap
