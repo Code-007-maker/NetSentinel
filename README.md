@@ -12,8 +12,8 @@ Latest smoke holdout results:
 
 | Model | Precision | Recall | F1 | FPR | ROC-AUC |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| World Model | 0.9923 | 0.6754 | 0.8037 | 0.0526 | 0.7435 |
-| Logistic Regression baseline | 0.9259 | 0.9115 | 0.9186 | 0.7778 | 0.8585 |
+| Logistic Regression baseline | 0.9923 | 0.6754 | 0.8037 | 0.0526 | 0.7435 |
+| World Model | 0.9259 | 0.9115 | 0.9186 | 0.7778 | 0.8585 |
 
 The World Model does **not** currently outperform the logistic-regression baseline on classification metrics. Its purpose is learned network-state representation, recursive future-state simulation, future-risk forecasting, MITRE ATT&CK interpretation, and feature-based evidence. In the current smoke holdout experiment, it operates at a lower false-positive rate.
 
